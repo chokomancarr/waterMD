@@ -1,0 +1,19 @@
+#version 330 core
+
+in vec4 v2f_normal;
+in vec4 v2f_color;
+
+layout (location=0) out vec4 outColor; //rgba
+layout (location=1) out vec4 outNormal; //xyz []
+layout (location=2) out vec4 outSpec; //spec gloss
+layout (location=3) out vec4 outEmi; //emi occlu
+
+void main()
+{
+	outColor = dot(v2f_normal.xyz, vec3(0.3, 0.3, -0.7))*v2f_color;
+	outNormal.rgb = normalize(v2f_normal.xyz);
+	outNormal.a = 0;
+	outSpec.rgb = vec3(1, 1, 1)*0.4;
+	outSpec.a = 0.6;
+	outEmi = vec4(0, 0, 0, 0);
+}

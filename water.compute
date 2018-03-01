@@ -1,0 +1,169 @@
+/*
+SPC flexible water model
+
+(kJ/mol): 1 kJ/mol -> KJ_CONV u nm2 ps-2 n-1
+*/
+
+#version 450 core
+#extension GL_ARB_compute_shader: enable
+#extension GL_ARB_shader_storage_buffer_object: enable
+//#extension GL_NV_shader_atomic_float: enable
+
+layout (std140, binding=3) buffer For {
+    vec4 fors[];
+};
+layout (std140, binding=4) buffer Pos {
+    vec4 poss[];
+};
+layout (std140, binding=5) buffer Vel {
+    vec4 vels[];
+};
+layout (std140, binding=6) buffer IO {
+    ivec4 bonds[]; //is oxygen, p1, p2
+};
+layout(std140, binding=7) buffer Prm {
+	float params[];
+};
+layout(std140, binding=8) buffer Out {
+	vec4 outputs[]; //potential, F*r
+};
+
+layout( local_size_x = 64, local_size_y = 1, local_size_z = 1 ) in;
+
+void main()
+{
+    const float deg2rad = 0.01745;
+    const float _ast = 0.1;
+
+	const float AVOGADRO = 6.022141;
+	const float KJ_CONV = 10 / 1.66 / AVOGADRO;
+    const float BOND_LENGTH = 1 * _ast;
+    const float BOND_ANGLE = 109.47 * deg2rad;
+    const float K_LINEAR = 345000 * KJ_CONV; //(kJ/mol) nm^2
+    const float K_RADIAL = 383 * KJ_CONV; //(kJ/mol) rad^2
+	const float LJ_EP = 4.184 * 0.1554253 * KJ_CONV; //(kJ/mol)
+	const float LJ_RO = 0.3165492; //nm
+	const float K_E = 8.99e-3 / 1.66;
+    const float DT = 1e-3; //1fs
+
+    const float MASS_H = 1.0;
+    const float MASS_O = 15.99;
+
+	const float wall = params[0];
+    const vec3 wall3 = vec3(wall,wall,wall);
+
+    const uint gid = gl_GlobalInvocationID.x;
+    
+    const float mass = mix(MASS_H, MASS_O, bonds[gid].x);
+	const float charge = (-bonds[gid].x * 3 + 1) * 0.41;
+	
+	const uint num = 256 * 3;
+
+    vec3 fo = fors[gid].xyz;
+    vec3 po = poss[gid].xyz;
+    vec3 vo = vels[gid].xyz;
+
+	uint bid1 = gid;
+	uint bid2 = gid + 2;
+
+    //------------- poss ------------------
+
+    vec3 pn = po + vo*DT + fo*DT*DT/mass/2;
+    pn /= wall3;
+    pn -= floor(pn);
+    pn *= wall3;
+
+    poss[gid].xyz = pn;
+
+    barrier();
+
+    //------------- force -----------------
+    
+    //bonds
+    vec3 poso1 = poss[bonds[gid].y].xyz;
+    vec3 poso2 = poss[bonds[gid].z].xyz;
+    vec3 dir1 = (poso1 - pn) / wall3;
+    dir1 -= round(dir1);
+    dir1 *= wall3;
+    float dst1 = length(dir1);
+    vec3 dir2 = (poso2 - pn) / wall3;
+    dir2 -= round(dir2);
+    dir2 *= wall3;
+    float dst2 = length(dir2);
+	
+    vec3 f = K_LINEAR * normalize(dir1) * (dst1 - BOND_LENGTH);
+	vec3 fr = vec3(0,0,0);
+	vec3 ft = fr;
+	
+	float u = 0;//0.5 * K_LINEAR * pow(dst1 - BOND_LENGTH, 2);
+    
+    if (bonds[gid].x == 1) {
+        f += K_LINEAR * normalize(dir2) * (dst2 - BOND_LENGTH);
+		//u += 0.5 * K_LINEAR * pow(dst1 - BOND_LENGTH, 2);
+		
+        //H <--dir1-- me --dir2--> H
+        vec3 t1 = normalize(cross(dir2, dir1));
+        vec3 rdir1 = normalize(cross(t1, dir1));
+        vec3 rdir2 = normalize(cross(dir2, t1));
+        float angle = acos(clamp(dot(normalize(dir1), normalize(dir2)), -1, 1));
+        f += (rdir1/dst1 + rdir2/dst2)*K_RADIAL*(angle - BOND_ANGLE);
+		//u += 0.5 * K_RADIAL * pow((1/dst1 + 1/dst2)*(angle - BOND_ANGLE), 2);
+		
+		//lennard-jones
+		// SPC model only considers OO interactions
+		for (uint i = 0; i < num; i += 3) {
+			if (i != gid) {
+				//me <--dp-- other
+				vec3 dp = (pn - poss[i].xyz) / wall3;
+				dp -= round(dp);
+				dp *= wall3;
+				float len = length(dp);
+				
+				ft = dp * 24 * LJ_EP * (2 * pow(LJ_RO, 12) / pow(len, 14) - pow(LJ_RO, 6) / pow(len, 8));
+				f += ft;
+				//u += 4 * LJ_EP * (pow(LJ_RO/len, 12) - pow(LJ_RO/len, 6));
+				//fr += f * len;
+			}
+		}
+	}
+    else {
+		bid1 = bonds[gid].y;
+		bid2 = max(gid, bonds[gid].z);
+
+        dir1 *= -1;
+        dir2 += dir1;
+        //me <--dir1-- O --dir2--> H
+        vec3 t1H = normalize(cross(dir2, dir1));
+        vec3 rdir = normalize(cross(dir1, t1H));
+        float angleH = acos(clamp(dot(normalize(dir1), normalize(dir2)), -1, 1));
+        f += (rdir / dst1)*K_RADIAL*(angleH - BOND_ANGLE);
+		//u +=  0.5 * K_RADIAL * pow((1 / dst1)*(angleH - BOND_ANGLE), 2);
+    }
+	
+	//*Coulomb's law
+	for (uint i = 0; i < num; i++) {
+		if (i < bid1 || i > bid2) {
+			float oc = (-bonds[i].x * 3 + 1) * 0.41;
+			vec3 dp = (pn - poss[i].xyz) / wall3;
+			dp -= round(dp);
+			dp *= wall3;
+			float len = length(dp);
+			ft = K_E * dp * oc * charge / pow(len, 3);
+			f += ft;
+			//u += oc * charge / len;
+			//fr += ft * len;
+		}
+	}
+	//*/
+	
+    fors[gid].xyz = f;
+	
+	outputs[gid].x = u / 2;
+	outputs[gid].y = length(fr) / 2;
+    
+    //------------- velo ------------------
+
+    vec3 vn = vo + (f + fo)*DT/mass/2;
+
+    vels[gid].xyz = vn;
+}
